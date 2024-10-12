@@ -1,10 +1,12 @@
 ﻿using Newtonsoft.Json.Linq;
 using System.Diagnostics;
 using System.Net.WebSockets;
+using System.Runtime.Versioning;
 using System.Text;
 
 namespace HtmlToImage.NET;
 
+[UnsupportedOSPlatform("browser")]
 public sealed class HtmlConverter : IDisposable
 {
 	public record class ChromeCdpInfo(
@@ -69,6 +71,7 @@ public sealed class HtmlConverter : IDisposable
 
 	public Tab NewTab() => new(this);
 
+	[UnsupportedOSPlatform("browser")]
 	public sealed class Tab
 	{
 		private record struct ResponseData(string Data);
