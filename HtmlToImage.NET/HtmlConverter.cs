@@ -1,12 +1,10 @@
 ﻿using Newtonsoft.Json.Linq;
 using System.Diagnostics;
 using System.Net.WebSockets;
-using System.Runtime.Versioning;
 using System.Text;
 
 namespace HtmlToImage.NET;
 
-[UnsupportedOSPlatform("browser")]
 public sealed class HtmlConverter : IDisposable
 {
 	public record class ChromeCdpInfo(
@@ -33,6 +31,9 @@ public sealed class HtmlConverter : IDisposable
 	/// <param name="extraArgs">Extra arguments to start the browser.</param>
 	public HtmlConverter(string chromiumLocation, ushort cdpPort, int windowWidth = 1920, int windowHeight = 1080, bool debug = false, List<string>? extraArgs = null)
 	{
+		if (cdpPort == 0)
+			cdpPort = Helper.GetNewFreePort();
+
 		extraArgs ??= new();
 		extraArgs.AddRange([
 			"--remote-allow-origins=*",
@@ -42,9 +43,6 @@ public sealed class HtmlConverter : IDisposable
 			"--no-first-run",
 			"--no-default-browser-check",
 		]);
-
-		if (cdpPort == 0)
-			cdpPort = Helper.GetNewFreePort();
 
 		this.Debug = debug;
 		this.CdpPort = cdpPort;
@@ -69,9 +67,8 @@ public sealed class HtmlConverter : IDisposable
 		this.HttpClient.Dispose();
 	}
 
-	public Tab NewTab() => new(this);
+	public Tab NewTab(string url = "about:blank") => new(this, url);
 
-	[UnsupportedOSPlatform("browser")]
 	public sealed class Tab
 	{
 		private record struct ResponseData(string Data);
@@ -83,11 +80,11 @@ public sealed class HtmlConverter : IDisposable
 		public ClientWebSocket WSClient { get; private set; }
 		public ChromeCdpInfo CdpInfo { get; private set; }
 
-		internal Tab(HtmlConverter parent)
+		internal Tab(HtmlConverter parent, string url)
 		{
 			this._parent = parent;
 			this.CdpInfo = parent.HttpClient
-				.PutAsync($"http://localhost:{parent.CdpPort}/json/new?about:blank", null).Await()
+				.PutAsync($"http://localhost:{parent.CdpPort}/json/new?{url}", null).Await()
 				.Content.ReadAsStringAsync().Await()
 				.FromJson<ChromeCdpInfo>();
 			if (parent.Debug)
@@ -96,44 +93,68 @@ public sealed class HtmlConverter : IDisposable
 			this.WSClient.ConnectAsync(new(this.CdpInfo.WebSocketDebuggerUrl), CancellationToken.None).Wait();
 		}
 
-		public async Task SendCommand(string commandName, Dictionary<string, string>? @params = null)
+
+		public JObject ReadUntilFindId(int id)
+		{
+			string message;
+			JObject obj;
+			do
+			{
+				message = this.WSClient.ReadOneMessage().Await().Item1.AsUTF8String();
+				if (this._parent.Debug)
+					Console.WriteLine(message);
+				obj = JObject.Parse(message);
+			}
+			while (!(obj["id"] is not null && (int)obj["id"]! == id));
+
+			return obj;
+		}
+		public async Task<int> SendCommand(string commandName, Dictionary<string, string>? @params = null)
 		{
 			byte[] buf = Encoding.UTF8.GetBytes(new
 			{
-				id = this._commandId++,
+				id = this._commandId,
 				method = commandName,
 				@params = @params ?? new()
 				// reserved keyword bruh
 			}.ToJson());
 
 			await this.WSClient.SendAsync(buf, WebSocketMessageType.Text, true, CancellationToken.None);
+			return this._commandId++;
 		}
 
-		public async Task NavigateTo(string url)
+		public async Task<string> NavigateTo(string url)
 		{
 			//await this._parent.Semaphore.WaitAsync();
 			await this.SendCommand("Page.enable");
 			await this.SendCommand("Page.navigate", new() { { "url", url } });
 
 			string message;
-			string? frameNavigatedMessage = null;
+			string frameNavigatedMessage;
+			JObject? obj = null;
 			do
 			{
 				message = this.WSClient.ReadOneMessage().Await().Item1.AsUTF8String();
 				if (message.Contains("Page.frameNavigated"))
+				{
 					frameNavigatedMessage = message;
+					obj = JObject.Parse(frameNavigatedMessage);
+				}
 				if (this._parent.Debug)
 					Console.WriteLine(message);
 			}
-			while (!message.Contains("Page.loadEventFired")); // waiting for load complete
+			while (!(message.Contains("Page.loadEventFired") && obj is not null)); // waiting for load complete
 
-			if (frameNavigatedMessage is not null)
-			{
-				JToken frame = JObject.Parse(frameNavigatedMessage)["params"]!["frame"]!;
-				this.CdpInfo.Url = (string)frame["url"]!;
-			}
+			JToken frame = obj["params"]!["frame"]!;
+			this.CdpInfo.Url = (string)frame["url"]!;
+			return (string)frame["id"]!;
 
 			//this._parent.Semaphore.Release();
+		}
+		public async Task HtmlAsPage(string html)
+		{
+			string frameId = await this.NavigateTo("about:blank");
+			this.ReadUntilFindId(await this.SendCommand("Page.setDocumentContent", new() { { "frameId", frameId }, { "html", html } }));
 		}
 		public async Task<byte[]> TakePhotoOfCurrentPage()
 		{
