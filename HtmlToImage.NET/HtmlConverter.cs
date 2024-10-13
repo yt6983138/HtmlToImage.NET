@@ -1,5 +1,6 @@
 ﻿using Newtonsoft.Json.Linq;
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.Net.WebSockets;
 using System.Text;
 
@@ -69,16 +70,24 @@ public sealed class HtmlConverter : IDisposable
 
 	public Tab NewTab(string url = "about:blank") => new(this, url);
 
-	public sealed class Tab
+	public sealed class Tab : IDisposable
 	{
-		private record struct ResponseData(string Data);
-		private record struct ScreenShotResponse(int Id, ResponseData Result);
+		public enum PhotoType
+		{
+			Jpeg,
+			Png,
+			Webp
+		}
+#pragma warning disable IDE1006 // Naming Styles
+		public record class ViewPort(double x, double y, double width, double height, double scale);
+#pragma warning restore IDE1006 // Naming Styles
 
 		private int _commandId;
 		private HtmlConverter _parent;
 
 		public ClientWebSocket WSClient { get; private set; }
 		public ChromeCdpInfo CdpInfo { get; private set; }
+		internal SemaphoreSlim CommonLock { get; private set; } = new(1, 1);
 
 		internal Tab(HtmlConverter parent, string url)
 		{
@@ -93,8 +102,21 @@ public sealed class HtmlConverter : IDisposable
 			this.WSClient.ConnectAsync(new(this.CdpInfo.WebSocketDebuggerUrl), CancellationToken.None).Wait();
 		}
 
+		internal async Task<int> SendCommandInternal(string commandName, Dictionary<string, object>? @params = null)
+		{
+			byte[] buf = Encoding.UTF8.GetBytes(new
+			{
+				id = this._commandId,
+				method = commandName,
+				@params = @params ?? new()
+				// reserved keyword bruh
+			}.ToJson());
 
-		public JObject ReadUntilFindId(int id)
+			await this.WSClient.SendAsync(buf, WebSocketMessageType.Text, true, CancellationToken.None);
+
+			return this._commandId++;
+		}
+		internal JObject ReadUntilFindIdInternal(int id)
 		{
 			string message;
 			JObject obj;
@@ -109,25 +131,27 @@ public sealed class HtmlConverter : IDisposable
 
 			return obj;
 		}
-		public async Task<int> SendCommand(string commandName, Dictionary<string, string>? @params = null)
+		public JObject ReadUntilFindId(int id)
 		{
-			byte[] buf = Encoding.UTF8.GetBytes(new
-			{
-				id = this._commandId,
-				method = commandName,
-				@params = @params ?? new()
-				// reserved keyword bruh
-			}.ToJson());
-
-			await this.WSClient.SendAsync(buf, WebSocketMessageType.Text, true, CancellationToken.None);
-			return this._commandId++;
+			this.CommonLock.Wait();
+			JObject result = this.ReadUntilFindIdInternal(id);
+			this.CommonLock.Release();
+			return result;
+		}
+		public async Task<int> SendCommand(string commandName, Dictionary<string, object>? @params = null)
+		{
+			await this.CommonLock.WaitAsync();
+			int result = await this.SendCommandInternal(commandName, @params);
+			this.CommonLock.Release();
+			return result;
 		}
 
 		public async Task<string> NavigateTo(string url)
 		{
-			//await this._parent.Semaphore.WaitAsync();
-			await this.SendCommand("Page.enable");
-			await this.SendCommand("Page.navigate", new() { { "url", url } });
+			this.CommonLock.Wait();
+
+			await this.SendCommandInternal("Page.enable");
+			await this.SendCommandInternal("Page.navigate", new() { { "url", url } });
 
 			string message;
 			string frameNavigatedMessage;
@@ -147,33 +171,53 @@ public sealed class HtmlConverter : IDisposable
 
 			JToken frame = obj["params"]!["frame"]!;
 			this.CdpInfo.Url = (string)frame["url"]!;
-			return (string)frame["id"]!;
 
-			//this._parent.Semaphore.Release();
+			this.CommonLock.Release();
+
+			return (string)frame["id"]!;
 		}
 		public async Task HtmlAsPage(string html)
 		{
 			string frameId = await this.NavigateTo("about:blank");
-			this.ReadUntilFindId(await this.SendCommand("Page.setDocumentContent", new() { { "frameId", frameId }, { "html", html } }));
+
+			await this.CommonLock.WaitAsync();
+			this.ReadUntilFindIdInternal(await this.SendCommandInternal("Page.setDocumentContent", new() { { "frameId", frameId }, { "html", html } }));
+			this.CommonLock.Release();
 		}
-		public async Task<byte[]> TakePhotoOfCurrentPage()
+		[Experimental("HTI0001")]
+		public async Task SetViewPortSize(int width, int height, double deviceScaleFactor, bool mobile)
+		{
+			await this.SendCommand(
+				"Page.setDeviceMetricsOverride",
+				new()
+				{
+					{ "width", width },
+					{ "height", height },
+					{ "deviceScaleFactor", deviceScaleFactor },
+					{ "mobile", mobile }
+				});
+		}
+		public async Task<byte[]> TakePhotoOfCurrentPage(PhotoType photoType = PhotoType.Png, byte quality = 100, ViewPort? clip = null)
 		{
 			await this._parent.TakePhotoLock.WaitAsync();
-			await this.SendCommand("Page.bringToFront");
-			await this.SendCommand("Page.disable");
-			await this.SendCommand("Page.captureScreenshot");
-			while (true)
-			{
-				(MemoryStream? stream, WebSocketReceiveResult? result) = await this.WSClient.ReadOneMessage();
-				string str = stream.AsUTF8String();
-				if (this._parent.Debug)
-					Console.WriteLine(str);
-				if (str.Contains("result") && str.Contains("data"))
-				{
-					this._parent.TakePhotoLock.Release();
-					return str.FromJson<ScreenShotResponse>().Result.Data.DecodeAsBase64();
-				}
-			}
+			await this.CommonLock.WaitAsync();
+			await this.SendCommandInternal("Page.bringToFront");
+			await this.SendCommandInternal("Page.disable");
+			byte[] result = ((string)this.ReadUntilFindIdInternal(await this.SendCommandInternal("Page.captureScreenshot"))["result"]!["data"]!).DecodeAsBase64();
+			this.CommonLock.Release();
+			this._parent.TakePhotoLock.Release();
+			return result;
+		}
+
+		~Tab()
+		{
+			this.Dispose();
+		}
+		public void Dispose()
+		{
+			GC.SuppressFinalize(this);
+			this.SendCommand("Page.close").Wait();
+			this.WSClient.Dispose();
 		}
 	}
 }
