@@ -11,7 +11,7 @@ public sealed class HtmlConverter : IDisposable
 	public record class ChromeCdpInfo(
 		string Description, string DevToolsFrontendUrl, string FaviconUrl, string Id, string Url, string Title, string Type, string WebSocketDebuggerUrl)
 	{
-		public string Url { get; set; } = Url;
+		public string Url { get; internal set; } = Url;
 	}
 
 	public Process ChromiumProcess { get; private set; }
