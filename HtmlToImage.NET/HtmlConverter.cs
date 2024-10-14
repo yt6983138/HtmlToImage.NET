@@ -197,6 +197,13 @@ public sealed class HtmlConverter : IDisposable
 					{ "mobile", mobile }
 				});
 		}
+		public async Task<JToken> EvaluateJavaScript(string script)
+		{
+			await this.CommonLock.WaitAsync();
+			JObject result = this.ReadUntilFindIdInternal(await this.SendCommandInternal("Runtime.evaluate", new() { { "expression", script } }));
+			this.CommonLock.Release();
+			return result["result"]!;
+		}
 		public async Task<byte[]> TakePhotoOfCurrentPage(PhotoType photoType = PhotoType.Png, byte quality = 100, ViewPort? clip = null)
 		{
 			await this._parent.TakePhotoLock.WaitAsync();
