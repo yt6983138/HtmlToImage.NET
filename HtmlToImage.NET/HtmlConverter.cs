@@ -146,13 +146,16 @@ public sealed class HtmlConverter : IDisposable
 			return result;
 		}
 
-		public async Task<string> NavigateTo(string url)
+		public async Task<string> NavigateTo(string url, Func<Task>? thingsToDoBeforeWaiting = null)
 		{
+
+			await this.SendCommand("Page.enable");
+			await this.SendCommand("Page.navigate", new() { { "url", url } });
+
+			Task? t = thingsToDoBeforeWaiting?.Invoke();
+			if (t is not null) await t;
+
 			this.CommonLock.Wait();
-
-			await this.SendCommandInternal("Page.enable");
-			await this.SendCommandInternal("Page.navigate", new() { { "url", url } });
-
 			string message;
 			string frameNavigatedMessage;
 			JObject? obj = null;
@@ -176,9 +179,10 @@ public sealed class HtmlConverter : IDisposable
 
 			return (string)frame["id"]!;
 		}
-		public async Task HtmlAsPage(string html)
+		public async Task HtmlAsPage(string html, Action? afterNavigate = null)
 		{
 			string frameId = await this.NavigateTo("about:blank");
+			afterNavigate?.Invoke();
 
 			await this.CommonLock.WaitAsync();
 			this.ReadUntilFindIdInternal(await this.SendCommandInternal("Page.setDocumentContent", new() { { "frameId", frameId }, { "html", html } }));
