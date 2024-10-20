@@ -84,10 +84,12 @@ public sealed class HtmlConverter : IDisposable
 
 		private int _commandId;
 		private HtmlConverter _parent;
+		private List<JObject> _eventQueue = new();
 
 		public ClientWebSocket WSClient { get; private set; }
 		public ChromeCdpInfo CdpInfo { get; private set; }
 		internal SemaphoreSlim CommonLock { get; private set; } = new(1, 1);
+		public IReadOnlyList<JObject> Queue => this._eventQueue;
 
 		internal Tab(HtmlConverter parent, string url)
 		{
@@ -118,18 +120,37 @@ public sealed class HtmlConverter : IDisposable
 		}
 		internal JObject ReadUntilFindIdInternal(int id)
 		{
-			string message;
 			JObject obj;
 			do
 			{
-				message = this.WSClient.ReadOneMessage().Await().Item1.AsUTF8String();
+				obj = this.ReadOneMessage().Await().Item1;
 				if (this._parent.Debug)
-					Console.WriteLine(message);
-				obj = JObject.Parse(message);
+					Console.WriteLine(obj);
 			}
 			while (!(obj["id"] is not null && (int)obj["id"]! == id));
 
 			return obj;
+		}
+		public async Task<(JObject, WebSocketReceiveResult)> ReadOneMessage(CancellationToken cancellationToken = default, MemoryStream? stream = null)
+		{
+			stream ??= new();
+
+			WebSocketReceiveResult result;
+			byte[] buffer = new byte[1024];
+			do
+			{
+				Array.Clear(buffer);
+				result = await this.WSClient.ReceiveAsync(buffer, cancellationToken);
+				stream.Write(buffer);
+			}
+			while (!result.EndOfMessage);
+
+			JObject obj = JObject.Parse(stream.AsUTF8String());
+
+			if (obj["method"] is not null)
+				this._eventQueue.Add(obj);
+
+			return (obj, result);
 		}
 		public JObject ReadUntilFindId(int id)
 		{
@@ -148,31 +169,30 @@ public sealed class HtmlConverter : IDisposable
 
 		public async Task<string> NavigateTo(string url, Func<Task>? thingsToDoBeforeWaiting = null)
 		{
-
 			await this.SendCommand("Page.enable");
+			this._eventQueue.Clear();
 			await this.SendCommand("Page.navigate", new() { { "url", url } });
 
 			Task? t = thingsToDoBeforeWaiting?.Invoke();
 			if (t is not null) await t;
 
 			this.CommonLock.Wait();
-			string message;
-			string frameNavigatedMessage;
-			JObject? obj = null;
+			JObject? loadEvent;
+			JObject? frameNavigatedEvent;
+			bool firstLoop = true;
 			do
 			{
-				message = this.WSClient.ReadOneMessage().Await().Item1.AsUTF8String();
-				if (message.Contains("Page.frameNavigated"))
+				loadEvent = this.Queue.FirstOrDefault(x => (string)x["method"]! == "Page.loadEventFired");
+				frameNavigatedEvent = this.Queue.FirstOrDefault(x => (string)x["method"]! == "Page.frameNavigated");
+				if (!firstLoop)
 				{
-					frameNavigatedMessage = message;
-					obj = JObject.Parse(frameNavigatedMessage);
+					await this.ReadOneMessage();
 				}
-				if (this._parent.Debug)
-					Console.WriteLine(message);
+				else firstLoop = false;
 			}
-			while (!(message.Contains("Page.loadEventFired") && obj is not null)); // waiting for load complete
+			while (loadEvent is null || frameNavigatedEvent is null);
 
-			JToken frame = obj["params"]!["frame"]!;
+			JToken frame = frameNavigatedEvent["params"]!["frame"]!;
 			this.CdpInfo.Url = (string)frame["url"]!;
 
 			this.CommonLock.Release();

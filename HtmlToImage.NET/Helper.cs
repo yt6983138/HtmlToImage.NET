@@ -2,7 +2,6 @@
 using System.Diagnostics.CodeAnalysis;
 using System.Net;
 using System.Net.Sockets;
-using System.Net.WebSockets;
 using System.Text;
 
 namespace HtmlToImage.NET;
@@ -27,22 +26,6 @@ internal static class Helper
 	internal static byte[] DecodeAsBase64(this string data)
 	{
 		return Convert.FromBase64String(data);
-	}
-	public static async Task<(MemoryStream, WebSocketReceiveResult)> ReadOneMessage(this ClientWebSocket client, CancellationToken cancellationToken = default, MemoryStream? stream = null)
-	{
-		stream ??= new();
-
-		WebSocketReceiveResult result;
-		byte[] buffer = new byte[1024];
-		do
-		{
-			Array.Clear(buffer);
-			result = await client.ReceiveAsync(buffer, cancellationToken);
-			stream.Write(buffer);
-		}
-		while (!result.EndOfMessage);
-
-		return (stream, result);
 	}
 
 	[return: NotNull]
