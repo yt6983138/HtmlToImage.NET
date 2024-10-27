@@ -1,23 +1,32 @@
-﻿using Newtonsoft.Json;
-using System.Diagnostics.CodeAnalysis;
+﻿using System.Diagnostics.CodeAnalysis;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Text.Json;
 
 namespace HtmlToImage.NET;
 internal static class Helper
 {
+	private static readonly JsonSerializerOptions _indentedOption = new()
+	{
+		WriteIndented = true
+	};
+	private static readonly JsonSerializerOptions _deserializeOption = new()
+	{
+		PropertyNameCaseInsensitive = true,
+	};
+
 	internal static T Await<T>(this Task<T> task)
 	{
 		return task.GetAwaiter().GetResult();
 	}
 	internal static T FromJson<T>(this string json)
 	{
-		return JsonConvert.DeserializeObject<T>(json).EnsureNotNull();
+		return JsonSerializer.Deserialize<T>(json, _deserializeOption).EnsureNotNull();
 	}
-	internal static string ToJson(this object obj, bool humanReadable = true)
+	internal static string ToJson<T>(this T obj, bool humanReadable = true)
 	{
-		return JsonConvert.SerializeObject(obj, humanReadable ? Formatting.Indented : Formatting.None);
+		return JsonSerializer.Serialize(obj, humanReadable ? _indentedOption : null);
 	}
 	internal static string AsUTF8String(this MemoryStream stream)
 	{

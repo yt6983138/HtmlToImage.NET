@@ -1,8 +1,7 @@
-﻿using Newtonsoft.Json.Linq;
-using System.Diagnostics;
-using System.Diagnostics.CodeAnalysis;
+﻿using System.Diagnostics;
 using System.Net.WebSockets;
 using System.Text;
+using System.Text.Json.Nodes;
 
 namespace HtmlToImage.NET;
 
@@ -30,7 +29,7 @@ public sealed class HtmlConverter : IDisposable
 	/// <param name="windowWidth">Width of the window.</param>
 	/// <param name="windowHeight">Height of the window.</param>
 	/// <param name="extraArgs">Extra arguments to start the browser.</param>
-	public HtmlConverter(string chromiumLocation, ushort cdpPort, int windowWidth = 1920, int windowHeight = 1080, bool debug = false, List<string>? extraArgs = null)
+	public HtmlConverter(string chromiumLocation, ushort cdpPort, int windowWidth = 1920, int windowHeight = 1080, bool debug = false, bool showChromiumOutput = false, List<string>? extraArgs = null)
 	{
 		if (cdpPort == 0)
 			cdpPort = Helper.GetNewFreePort();
@@ -50,12 +49,20 @@ public sealed class HtmlConverter : IDisposable
 		this.ChromiumProcess = Process.Start(new ProcessStartInfo(chromiumLocation, extraArgs)
 		{
 			UseShellExecute = false,
-			RedirectStandardOutput = !debug,
-			RedirectStandardError = !debug
+			RedirectStandardOutput = !showChromiumOutput,
+			RedirectStandardError = !showChromiumOutput
 		}).EnsureNotNull();
 
 		this.HttpClient = new();
+
+		AppDomain.CurrentDomain.ProcessExit += this.CurrentDomain_ProcessExit;
 	}
+
+	private void CurrentDomain_ProcessExit(object? sender, EventArgs e)
+	{
+		this.ChromiumProcess.Kill();
+	}
+
 	~HtmlConverter()
 	{
 		this.Dispose();
@@ -66,6 +73,7 @@ public sealed class HtmlConverter : IDisposable
 		this.ChromiumProcess.Kill();
 		this.ChromiumProcess.Dispose();
 		this.HttpClient.Dispose();
+		AppDomain.CurrentDomain.ProcessExit -= this.CurrentDomain_ProcessExit;
 	}
 
 	public Tab NewTab(string url = "about:blank") => new(this, url);
@@ -84,43 +92,46 @@ public sealed class HtmlConverter : IDisposable
 
 		private int _commandId;
 		private HtmlConverter _parent;
-		private List<JObject> _eventQueue = new();
+		private List<JsonNode> _eventQueue = new();
 
 		public ClientWebSocket WSClient { get; private set; }
 		public ChromeCdpInfo CdpInfo { get; private set; }
 		internal SemaphoreSlim CommonLock { get; private set; } = new(1, 1);
-		public IReadOnlyList<JObject> Queue => this._eventQueue;
+		public IReadOnlyList<JsonNode> Queue => this._eventQueue;
 
 		internal Tab(HtmlConverter parent, string url)
 		{
 			this._parent = parent;
-			this.CdpInfo = parent.HttpClient
+			string str = parent.HttpClient
 				.PutAsync($"http://localhost:{parent.CdpPort}/json/new?{url}", null).Await()
-				.Content.ReadAsStringAsync().Await()
-				.FromJson<ChromeCdpInfo>();
+				.Content.ReadAsStringAsync().Await();
+			this.CdpInfo = str.FromJson<ChromeCdpInfo>();
+
 			if (parent.Debug)
 				Console.WriteLine(this.CdpInfo);
 			this.WSClient = new();
+			this.WSClient.Options.KeepAliveInterval = TimeSpan.FromSeconds(20);
 			this.WSClient.ConnectAsync(new(this.CdpInfo.WebSocketDebuggerUrl), CancellationToken.None).Wait();
 		}
 
 		internal async Task<int> SendCommandInternal(string commandName, Dictionary<string, object>? @params = null)
 		{
-			byte[] buf = Encoding.UTF8.GetBytes(new
+			string str = new
 			{
 				id = this._commandId,
 				method = commandName,
 				@params = @params ?? new()
 				// reserved keyword bruh
-			}.ToJson());
+			}.ToJson();
+			byte[] buf = Encoding.UTF8.GetBytes(str);
 
 			await this.WSClient.SendAsync(buf, WebSocketMessageType.Text, true, CancellationToken.None);
 
 			return this._commandId++;
 		}
-		internal JObject ReadUntilFindIdInternal(int id)
+		internal JsonNode ReadUntilFindIdInternal(int id)
 		{
-			JObject obj;
+			JsonNode obj;
 			do
 			{
 				obj = this.ReadOneMessage().Await().Item1;
@@ -131,12 +142,12 @@ public sealed class HtmlConverter : IDisposable
 
 			return obj;
 		}
-		public async Task<(JObject, WebSocketReceiveResult)> ReadOneMessage(CancellationToken cancellationToken = default, MemoryStream? stream = null)
+		public async Task<(JsonNode, WebSocketReceiveResult)> ReadOneMessage(CancellationToken cancellationToken = default)
 		{
-			stream ??= new();
+			using MemoryStream stream = new();
 
 			WebSocketReceiveResult result;
-			byte[] buffer = new byte[1024];
+			byte[] buffer = new byte[4096];
 			do
 			{
 				Array.Clear(buffer);
@@ -145,17 +156,27 @@ public sealed class HtmlConverter : IDisposable
 			}
 			while (!result.EndOfMessage);
 
-			JObject obj = JObject.Parse(stream.AsUTF8String());
+			if (this._parent.Debug)
+				Console.WriteLine(stream.AsUTF8String());
+			stream.Seek(0, SeekOrigin.Begin);
+
+			int length = 0;
+			while (stream.ReadByte() > 0) length++;
+
+			stream.SetLength(length);
+			stream.Seek(0, SeekOrigin.Begin);
+
+			JsonNode obj = JsonNode.Parse(stream)!;
 
 			if (obj["method"] is not null)
 				this._eventQueue.Add(obj);
 
 			return (obj, result);
 		}
-		public JObject ReadUntilFindId(int id)
+		public JsonNode ReadUntilFindId(int id)
 		{
 			this.CommonLock.Wait();
-			JObject result = this.ReadUntilFindIdInternal(id);
+			JsonNode result = this.ReadUntilFindIdInternal(id);
 			this.CommonLock.Release();
 			return result;
 		}
@@ -177,8 +198,8 @@ public sealed class HtmlConverter : IDisposable
 			if (t is not null) await t;
 
 			this.CommonLock.Wait();
-			JObject? loadEvent;
-			JObject? frameNavigatedEvent;
+			JsonNode? loadEvent;
+			JsonNode? frameNavigatedEvent;
 			bool firstLoop = true;
 			do
 			{
@@ -192,7 +213,7 @@ public sealed class HtmlConverter : IDisposable
 			}
 			while (loadEvent is null || frameNavigatedEvent is null);
 
-			JToken frame = frameNavigatedEvent["params"]!["frame"]!;
+			JsonNode frame = frameNavigatedEvent["params"]!["frame"]!;
 			this.CdpInfo.Url = (string)frame["url"]!;
 
 			this.CommonLock.Release();
@@ -208,11 +229,10 @@ public sealed class HtmlConverter : IDisposable
 			this.ReadUntilFindIdInternal(await this.SendCommandInternal("Page.setDocumentContent", new() { { "frameId", frameId }, { "html", html } }));
 			this.CommonLock.Release();
 		}
-		[Experimental("HTI0001")]
 		public async Task SetViewPortSize(int width, int height, double deviceScaleFactor, bool mobile)
 		{
 			await this.SendCommand(
-				"Page.setDeviceMetricsOverride",
+				"Emulation.setDeviceMetricsOverride",
 				new()
 				{
 					{ "width", width },
@@ -221,10 +241,10 @@ public sealed class HtmlConverter : IDisposable
 					{ "mobile", mobile }
 				});
 		}
-		public async Task<JToken> EvaluateJavaScript(string script)
+		public async Task<JsonNode> EvaluateJavaScript(string script)
 		{
 			await this.CommonLock.WaitAsync();
-			JObject result = this.ReadUntilFindIdInternal(await this.SendCommandInternal("Runtime.evaluate", new() { { "expression", script } }));
+			JsonNode result = this.ReadUntilFindIdInternal(await this.SendCommandInternal("Runtime.evaluate", new() { { "expression", script } }));
 			this.CommonLock.Release();
 			return result["result"]!;
 		}
@@ -234,7 +254,16 @@ public sealed class HtmlConverter : IDisposable
 			await this.CommonLock.WaitAsync();
 			await this.SendCommandInternal("Page.bringToFront");
 			await this.SendCommandInternal("Page.disable");
-			byte[] result = ((string)this.ReadUntilFindIdInternal(await this.SendCommandInternal("Page.captureScreenshot"))["result"]!["data"]!).DecodeAsBase64();
+
+			Dictionary<string, object> arg = new()
+			{
+				{ "format", photoType.ToString().ToLower() }
+			};
+			if (photoType == PhotoType.Jpeg) arg.Add("quality", quality);
+			if (clip is not null) arg.Add("clip", clip);
+
+			int id = await this.SendCommandInternal("Page.captureScreenshot", arg);
+			byte[] result = ((string)this.ReadUntilFindIdInternal(id)["result"]!["data"]!).DecodeAsBase64();
 			this.CommonLock.Release();
 			this._parent.TakePhotoLock.Release();
 			return result;
