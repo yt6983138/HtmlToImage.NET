@@ -1,6 +1,8 @@
 ﻿using System.Diagnostics;
 using System.Net.WebSockets;
+using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.Json;
 using System.Text.Json.Nodes;
 
 namespace HtmlToImage.NET;
@@ -248,10 +250,10 @@ public sealed class HtmlConverter : IDisposable
 			this.CommonLock.Release();
 			return result["result"]!;
 		}
-		public async Task<byte[]> TakePhotoOfCurrentPage(PhotoType photoType = PhotoType.Png, byte quality = 100, ViewPort? clip = null)
+		public async Task<byte[]> TakePhotoOfCurrentPage(PhotoType photoType = PhotoType.Png, byte quality = 100, ViewPort? clip = null, CancellationToken ct = default)
 		{
-			await this._parent.TakePhotoLock.WaitAsync();
-			await this.CommonLock.WaitAsync();
+			await this._parent.TakePhotoLock.WaitAsync(ct);
+			await this.CommonLock.WaitAsync(ct);
 			await this.SendCommandInternal("Page.bringToFront");
 			await this.SendCommandInternal("Page.disable");
 
@@ -263,10 +265,83 @@ public sealed class HtmlConverter : IDisposable
 			if (clip is not null) arg.Add("clip", clip);
 
 			int id = await this.SendCommandInternal("Page.captureScreenshot", arg);
-			byte[] result = ((string)this.ReadUntilFindIdInternal(id)["result"]!["data"]!).DecodeAsBase64();
+
+			MemoryStream stream = new();
+			byte[] buffer = new byte[4096];
+
+			byte[]? result = null;
+			while (true)
+			{
+				await ReadCore();
+
+				Span<byte> streamData = MemoryMarshal.CreateSpan(
+					ref MemoryMarshal.GetArrayDataReference(stream.GetBuffer()),
+					(int)stream.Length); // prevent reallocation
+
+				Func<string> error = () => Encoding.UTF8.GetString(stream.GetBuffer());
+
+				Utf8JsonReader reader = new(streamData);
+
+				// {"id":1,"result":{"debuggerId":"410155931499991781.746677355633306483"}}
+				// {"id":2,"result":{"data":"..."}}
+				// {"method":"Page.domContentEventFired","params":{"timestamp":955508.734977}}
+
+				reader.Read(); // object start
+				reader.Read(); // id or method
+				string? type = reader.GetString();
+				if (type == "method")
+				{
+					Utf8JsonReader anotherReader = new(streamData);
+					this._eventQueue.Add(JsonNode.Parse(ref reader)!);
+					continue;
+				}
+				else if (type != "id") throw new InvalidDataException();
+				// must be id now
+
+				reader.Read(); // id number
+				if (reader.GetInt32() != id) continue;
+
+				reader.Read(); // result or error
+				if (reader.GetString() != "result") throw new InvalidDataException(error());
+				reader.Read(); // object start
+				reader.Read(); // data
+				if (reader.TokenType == JsonTokenType.EndObject || reader.GetString() != "data")
+				{
+					result = null;
+					break;
+				}
+				reader.Read();
+				result = reader.GetBytesFromBase64();
+				break;
+			}
+
 			this.CommonLock.Release();
 			this._parent.TakePhotoLock.Release();
-			return result;
+			stream.Dispose();
+
+			return result ?? [];
+
+			async Task ReadCore()
+			{
+				stream.SetLength(0); // will zero out array internally
+
+				WebSocketReceiveResult wResult;
+				do
+				{
+					Array.Clear(buffer);
+					wResult = await this.WSClient.ReceiveAsync(buffer, ct);
+					stream.Write(buffer);
+				}
+				while (!wResult.EndOfMessage);
+
+				stream.Seek(0, SeekOrigin.Begin);
+
+				int length = 0;
+				while (stream.ReadByte() > 0) length++;
+
+				stream.SetLength(length);
+				stream.Seek(0, SeekOrigin.Begin);
+			}
 		}
 
 		~Tab()
