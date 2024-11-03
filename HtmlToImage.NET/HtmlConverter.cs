@@ -31,7 +31,14 @@ public sealed class HtmlConverter : IDisposable
 	/// <param name="windowWidth">Width of the window.</param>
 	/// <param name="windowHeight">Height of the window.</param>
 	/// <param name="extraArgs">Extra arguments to start the browser.</param>
-	public HtmlConverter(string chromiumLocation, ushort cdpPort, int windowWidth = 1920, int windowHeight = 1080, bool debug = false, bool showChromiumOutput = false, List<string>? extraArgs = null)
+	public HtmlConverter(
+		string chromiumLocation,
+		ushort cdpPort,
+		int windowWidth = 1920,
+		int windowHeight = 1080,
+		bool debug = false,
+		bool showChromiumOutput = false,
+		List<string>? extraArgs = null)
 	{
 		if (cdpPort == 0)
 			cdpPort = Helper.GetNewFreePort();
@@ -116,7 +123,7 @@ public sealed class HtmlConverter : IDisposable
 			this.WSClient.ConnectAsync(new(this.CdpInfo.WebSocketDebuggerUrl), CancellationToken.None).Wait();
 		}
 
-		internal async Task<int> SendCommandInternal(string commandName, Dictionary<string, object>? @params = null)
+		internal async Task<int> SendCommandInternal(string commandName, Dictionary<string, object>? @params = null, CancellationToken cancellationToken = default)
 		{
 			string str = new
 			{
@@ -127,16 +134,16 @@ public sealed class HtmlConverter : IDisposable
 			}.ToJson();
 			byte[] buf = Encoding.UTF8.GetBytes(str);
 
-			await this.WSClient.SendAsync(buf, WebSocketMessageType.Text, true, CancellationToken.None);
+			await this.WSClient.SendAsync(buf, WebSocketMessageType.Text, true, cancellationToken);
 
 			return this._commandId++;
 		}
-		internal JsonNode ReadUntilFindIdInternal(int id)
+		internal async Task<JsonNode> ReadUntilFindIdInternal(int id, CancellationToken cancellationToken = default)
 		{
 			JsonNode obj;
 			do
 			{
-				obj = this.ReadOneMessage().Await().Item1;
+				obj = (await this.ReadOneMessage(cancellationToken)).Item1;
 				if (this._parent.Debug)
 					Console.WriteLine(obj);
 			}
@@ -175,31 +182,31 @@ public sealed class HtmlConverter : IDisposable
 
 			return (obj, result);
 		}
-		public JsonNode ReadUntilFindId(int id)
+		public async Task<JsonNode> ReadUntilFindId(int id, CancellationToken cancellationToken = default)
 		{
-			this.CommonLock.Wait();
-			JsonNode result = this.ReadUntilFindIdInternal(id);
+			await this.CommonLock.WaitAsync(cancellationToken);
+			JsonNode result = await this.ReadUntilFindIdInternal(id, cancellationToken);
 			this.CommonLock.Release();
 			return result;
 		}
-		public async Task<int> SendCommand(string commandName, Dictionary<string, object>? @params = null)
+		public async Task<int> SendCommand(string commandName, Dictionary<string, object>? @params = null, CancellationToken cancellationToken = default)
 		{
-			await this.CommonLock.WaitAsync();
-			int result = await this.SendCommandInternal(commandName, @params);
+			await this.CommonLock.WaitAsync(cancellationToken);
+			int result = await this.SendCommandInternal(commandName, @params, cancellationToken);
 			this.CommonLock.Release();
 			return result;
 		}
 
-		public async Task<string> NavigateTo(string url, Func<Task>? thingsToDoBeforeWaiting = null)
+		public async Task<string> NavigateTo(string url, Func<Task>? thingsToDoBeforeWaiting = null, CancellationToken cancellationToken = default)
 		{
-			await this.SendCommand("Page.enable");
+			await this.SendCommand("Page.enable", cancellationToken: cancellationToken);
 			this._eventQueue.Clear();
-			await this.SendCommand("Page.navigate", new() { { "url", url } });
+			await this.SendCommand("Page.navigate", new() { { "url", url } }, cancellationToken: cancellationToken);
 
 			Task? t = thingsToDoBeforeWaiting?.Invoke();
 			if (t is not null) await t;
 
-			this.CommonLock.Wait();
+			await this.CommonLock.WaitAsync(cancellationToken);
 			JsonNode? loadEvent;
 			JsonNode? frameNavigatedEvent;
 			bool firstLoop = true;
@@ -209,7 +216,7 @@ public sealed class HtmlConverter : IDisposable
 				frameNavigatedEvent = this.Queue.FirstOrDefault(x => (string)x["method"]! == "Page.frameNavigated");
 				if (!firstLoop)
 				{
-					await this.ReadOneMessage();
+					await this.ReadOneMessage(cancellationToken);
 				}
 				else firstLoop = false;
 			}
@@ -222,16 +229,17 @@ public sealed class HtmlConverter : IDisposable
 
 			return (string)frame["id"]!;
 		}
-		public async Task HtmlAsPage(string html, Action? afterNavigate = null)
+		public async Task HtmlAsPage(string html, Action? afterNavigate = null, CancellationToken cancellationToken = default)
 		{
-			string frameId = await this.NavigateTo("about:blank");
+			string frameId = await this.NavigateTo("about:blank", cancellationToken: cancellationToken);
 			afterNavigate?.Invoke();
 
-			await this.CommonLock.WaitAsync();
-			this.ReadUntilFindIdInternal(await this.SendCommandInternal("Page.setDocumentContent", new() { { "frameId", frameId }, { "html", html } }));
+			await this.CommonLock.WaitAsync(cancellationToken);
+			await this.ReadUntilFindIdInternal(
+				await this.SendCommandInternal("Page.setDocumentContent", new() { { "frameId", frameId }, { "html", html } }, cancellationToken), cancellationToken);
 			this.CommonLock.Release();
 		}
-		public async Task SetViewPortSize(int width, int height, double deviceScaleFactor, bool mobile)
+		public async Task SetViewPortSize(int width, int height, double deviceScaleFactor, bool mobile, CancellationToken cancellationToken = default)
 		{
 			await this.SendCommand(
 				"Emulation.setDeviceMetricsOverride",
@@ -241,12 +249,13 @@ public sealed class HtmlConverter : IDisposable
 					{ "height", height },
 					{ "deviceScaleFactor", deviceScaleFactor },
 					{ "mobile", mobile }
-				});
+				}, cancellationToken);
 		}
-		public async Task<JsonNode> EvaluateJavaScript(string script)
+		public async Task<JsonNode> EvaluateJavaScript(string script, CancellationToken cancellationToken = default)
 		{
-			await this.CommonLock.WaitAsync();
-			JsonNode result = this.ReadUntilFindIdInternal(await this.SendCommandInternal("Runtime.evaluate", new() { { "expression", script } }));
+			await this.CommonLock.WaitAsync(cancellationToken);
+			JsonNode result = await this.ReadUntilFindIdInternal(
+				await this.SendCommandInternal("Runtime.evaluate", new() { { "expression", script } }, cancellationToken), cancellationToken);
 			this.CommonLock.Release();
 			return result["result"]!;
 		}
@@ -254,8 +263,8 @@ public sealed class HtmlConverter : IDisposable
 		{
 			await this._parent.TakePhotoLock.WaitAsync(ct);
 			await this.CommonLock.WaitAsync(ct);
-			await this.SendCommandInternal("Page.bringToFront");
-			await this.SendCommandInternal("Page.disable");
+			await this.SendCommandInternal("Page.bringToFront", cancellationToken: ct);
+			await this.SendCommandInternal("Page.disable", cancellationToken: ct);
 
 			Dictionary<string, object> arg = new()
 			{
@@ -264,12 +273,12 @@ public sealed class HtmlConverter : IDisposable
 			if (photoType == PhotoType.Jpeg) arg.Add("quality", quality);
 			if (clip is not null) arg.Add("clip", clip);
 
-			int id = await this.SendCommandInternal("Page.captureScreenshot", arg);
+			int id = await this.SendCommandInternal("Page.captureScreenshot", arg, ct);
 
 			MemoryStream stream = new();
 			byte[] buffer = new byte[4096];
 
-			byte[]? result = null;
+			byte[] result = [];
 			while (true)
 			{
 				await ReadCore();
@@ -292,7 +301,7 @@ public sealed class HtmlConverter : IDisposable
 				if (type == "method")
 				{
 					Utf8JsonReader anotherReader = new(streamData);
-					this._eventQueue.Add(JsonNode.Parse(ref reader)!);
+					this._eventQueue.Add(JsonNode.Parse(ref anotherReader)!);
 					continue;
 				}
 				else if (type != "id") throw new InvalidDataException();
@@ -307,7 +316,7 @@ public sealed class HtmlConverter : IDisposable
 				reader.Read(); // data
 				if (reader.TokenType == JsonTokenType.EndObject || reader.GetString() != "data")
 				{
-					result = null;
+					result = [];
 					break;
 				}
 				reader.Read();
@@ -319,7 +328,7 @@ public sealed class HtmlConverter : IDisposable
 			this._parent.TakePhotoLock.Release();
 			stream.Dispose();
 
-			return result ?? [];
+			return result;
 
 			async Task ReadCore()
 			{
