@@ -21,7 +21,7 @@ public sealed class HtmlConverter : IDisposable
 
 	public bool Debug { get; set; }
 
-	internal SemaphoreSlim TakePhotoLock { get; set; } = new(1, 1);
+	internal CustomSemaphoreSlim TakePhotoLock { get; set; } = new(1, 1);
 
 	/// <summary>
 	/// Create a new instance of <see cref="HtmlConverter"/>.
@@ -82,6 +82,7 @@ public sealed class HtmlConverter : IDisposable
 		this.ChromiumProcess.Kill();
 		this.ChromiumProcess.Dispose();
 		this.HttpClient.Dispose();
+		this.TakePhotoLock.Dispose();
 		AppDomain.CurrentDomain.ProcessExit -= this.CurrentDomain_ProcessExit;
 	}
 
@@ -105,7 +106,7 @@ public sealed class HtmlConverter : IDisposable
 
 		public ClientWebSocket WSClient { get; private set; }
 		public ChromeCdpInfo CdpInfo { get; private set; }
-		internal SemaphoreSlim CommonLock { get; private set; } = new(1, 1);
+		internal CustomSemaphoreSlim CommonLock { get; private set; } = new(1, 1);
 		public IReadOnlyList<JsonNode> Queue => this._eventQueue;
 
 		internal Tab(HtmlConverter parent, string url)
@@ -125,9 +126,10 @@ public sealed class HtmlConverter : IDisposable
 
 		internal async Task<int> SendCommandInternal(string commandName, Dictionary<string, object>? @params = null, CancellationToken cancellationToken = default)
 		{
+			int val = this._commandId++;
 			string str = new
 			{
-				id = this._commandId,
+				id = val,
 				method = commandName,
 				@params = @params ?? new()
 				// reserved keyword bruh
@@ -136,7 +138,7 @@ public sealed class HtmlConverter : IDisposable
 
 			await this.WSClient.SendAsync(buf, WebSocketMessageType.Text, true, cancellationToken);
 
-			return this._commandId++;
+			return val;
 		}
 		internal async Task<JsonNode> ReadUntilFindIdInternal(int id, CancellationToken cancellationToken = default)
 		{
@@ -184,16 +186,14 @@ public sealed class HtmlConverter : IDisposable
 		}
 		public async Task<JsonNode> ReadUntilFindId(int id, CancellationToken cancellationToken = default)
 		{
-			await this.CommonLock.WaitAsync(cancellationToken);
+			using IDisposable _ = await this.CommonLock.DisposableLockAsync(cancellationToken);
 			JsonNode result = await this.ReadUntilFindIdInternal(id, cancellationToken);
-			this.CommonLock.Release();
 			return result;
 		}
 		public async Task<int> SendCommand(string commandName, Dictionary<string, object>? @params = null, CancellationToken cancellationToken = default)
 		{
-			await this.CommonLock.WaitAsync(cancellationToken);
+			using IDisposable _ = await this.CommonLock.DisposableLockAsync(cancellationToken);
 			int result = await this.SendCommandInternal(commandName, @params, cancellationToken);
-			this.CommonLock.Release();
 			return result;
 		}
 
@@ -201,12 +201,17 @@ public sealed class HtmlConverter : IDisposable
 		{
 			await this.SendCommand("Page.enable", cancellationToken: cancellationToken);
 			this._eventQueue.Clear();
-			await this.SendCommand("Page.navigate", new() { { "url", url } }, cancellationToken: cancellationToken);
+			JsonNode result = await this.ReadUntilFindId(
+				await this.SendCommand("Page.navigate", new() { { "url", url } }, cancellationToken: cancellationToken),
+				cancellationToken);
+
+			JsonNode? error = result["result"]!["errorText"];
+			if (error is not null) throw new InvalidOperationException((string)error!);
 
 			Task? t = thingsToDoBeforeWaiting?.Invoke();
 			if (t is not null) await t;
 
-			await this.CommonLock.WaitAsync(cancellationToken);
+			using IDisposable _ = await this.CommonLock.DisposableLockAsync(cancellationToken);
 			JsonNode? loadEvent;
 			JsonNode? frameNavigatedEvent;
 			bool firstLoop = true;
@@ -225,8 +230,6 @@ public sealed class HtmlConverter : IDisposable
 			JsonNode frame = frameNavigatedEvent["params"]!["frame"]!;
 			this.CdpInfo.Url = (string)frame["url"]!;
 
-			this.CommonLock.Release();
-
 			return (string)frame["id"]!;
 		}
 		public async Task HtmlAsPage(string html, Action? afterNavigate = null, CancellationToken cancellationToken = default)
@@ -234,10 +237,10 @@ public sealed class HtmlConverter : IDisposable
 			string frameId = await this.NavigateTo("about:blank", cancellationToken: cancellationToken);
 			afterNavigate?.Invoke();
 
-			await this.CommonLock.WaitAsync(cancellationToken);
+			using IDisposable _ = await this.CommonLock.DisposableLockAsync(cancellationToken);
+
 			await this.ReadUntilFindIdInternal(
 				await this.SendCommandInternal("Page.setDocumentContent", new() { { "frameId", frameId }, { "html", html } }, cancellationToken), cancellationToken);
-			this.CommonLock.Release();
 		}
 		public async Task SetViewPortSize(int width, int height, double deviceScaleFactor, bool mobile, CancellationToken cancellationToken = default)
 		{
@@ -253,16 +256,17 @@ public sealed class HtmlConverter : IDisposable
 		}
 		public async Task<JsonNode> EvaluateJavaScript(string script, CancellationToken cancellationToken = default)
 		{
-			await this.CommonLock.WaitAsync(cancellationToken);
+			using IDisposable _ = await this.CommonLock.DisposableLockAsync(cancellationToken);
+
 			JsonNode result = await this.ReadUntilFindIdInternal(
 				await this.SendCommandInternal("Runtime.evaluate", new() { { "expression", script } }, cancellationToken), cancellationToken);
-			this.CommonLock.Release();
 			return result["result"]!;
 		}
-		public async Task<byte[]> TakePhotoOfCurrentPage(PhotoType photoType = PhotoType.Png, byte quality = 100, ViewPort? clip = null, CancellationToken ct = default)
+		public async Task<MemoryStream> TakePhotoOfCurrentPage(PhotoType photoType = PhotoType.Png, byte quality = 100, ViewPort? clip = null, CancellationToken ct = default)
 		{
-			await this._parent.TakePhotoLock.WaitAsync(ct);
-			await this.CommonLock.WaitAsync(ct);
+			using IDisposable _2 = await this._parent.TakePhotoLock.DisposableLockAsync(ct);
+			using IDisposable _ = await this.CommonLock.DisposableLockAsync(ct);
+
 			await this.SendCommandInternal("Page.bringToFront", cancellationToken: ct);
 			await this.SendCommandInternal("Page.disable", cancellationToken: ct);
 
@@ -275,10 +279,10 @@ public sealed class HtmlConverter : IDisposable
 
 			int id = await this.SendCommandInternal("Page.captureScreenshot", arg, ct);
 
-			MemoryStream stream = new();
+			using MemoryStream stream = new();
 			byte[] buffer = new byte[4096];
 
-			byte[] result = [];
+			MemoryStream? result = null;
 			while (true)
 			{
 				await ReadCore();
@@ -316,19 +320,15 @@ public sealed class HtmlConverter : IDisposable
 				reader.Read(); // data
 				if (reader.TokenType == JsonTokenType.EndObject || reader.GetString() != "data")
 				{
-					result = [];
+					result = null;
 					break;
 				}
 				reader.Read();
-				result = reader.GetBytesFromBase64();
+				result = new(reader.GetBytesFromBase64());
 				break;
 			}
 
-			this.CommonLock.Release();
-			this._parent.TakePhotoLock.Release();
-			stream.Dispose();
-
-			return result;
+			return result ?? new();
 
 			async Task ReadCore()
 			{
@@ -362,6 +362,7 @@ public sealed class HtmlConverter : IDisposable
 			GC.SuppressFinalize(this);
 			this.SendCommand("Page.close").Wait();
 			this.WSClient.Dispose();
+			this.CommonLock.Dispose();
 		}
 	}
 }
