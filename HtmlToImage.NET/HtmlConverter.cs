@@ -10,12 +10,25 @@ namespace HtmlToImage.NET;
 public sealed class HtmlConverter : IDisposable
 {
 	public record class ChromeCdpInfo(
-		string Description, string DevToolsFrontendUrl, string FaviconUrl, string Id, string Url, string Title, string Type, string WebSocketDebuggerUrl)
+		string Description,
+		string DevToolsFrontendUrl,
+		string FaviconUrl,
+		string Id,
+		string Url,
+		string Title,
+		string Type,
+		string WebSocketDebuggerUrl)
 	{
 		public string Url { get; internal set; } = Url;
+
+		public string FullFrontendUrl =>
+			$"localhost:{this.DevToolsFrontendUrl[(this.DevToolsFrontendUrl.IndexOf("localhost:") + 10)..this.DevToolsFrontendUrl.IndexOf("/devtools/page/")]}" +
+			$"{this.DevToolsFrontendUrl}";
 	}
 
 	public Process ChromiumProcess { get; private set; }
+	public StreamReader ChromiumStandardOut { get; private set; } = new(new MemoryStream());
+	public StreamReader ChromiumStandardError { get; private set; } = new(new MemoryStream());
 	public ushort CdpPort { get; private set; }
 	public HttpClient HttpClient { get; private set; }
 
@@ -30,6 +43,8 @@ public sealed class HtmlConverter : IDisposable
 	/// <param name="cdpPort">The port for communication with browser, put zero to get a (unused) random one.</param>
 	/// <param name="windowWidth">Width of the window.</param>
 	/// <param name="windowHeight">Height of the window.</param>
+	/// <param name="debug">Debug mode (print what the library receives and other things).</param>
+	/// <param name="showChromiumOutput">Show chromium output to current console or not.</param>
 	/// <param name="extraArgs">Extra arguments to start the browser.</param>
 	public HtmlConverter(
 		string chromiumLocation,
@@ -50,18 +65,27 @@ public sealed class HtmlConverter : IDisposable
 			$"--remote-debugging-port={cdpPort}",
 			"--headless=new",
 			"--no-first-run",
-			"--no-default-browser-check",
+			"--no-default-browser-check"
 		]);
 
 		this.Debug = debug;
+		// TODO: add cdp port get from stderr from chromium output
 		this.CdpPort = cdpPort;
 		this.ChromiumProcess = Process.Start(new ProcessStartInfo(chromiumLocation, extraArgs)
-		{
-			UseShellExecute = false,
-			RedirectStandardOutput = !showChromiumOutput,
-			RedirectStandardError = !showChromiumOutput
-		}).EnsureNotNull();
+			{
+				UseShellExecute = false,
+				RedirectStandardOutput = true,
+				RedirectStandardError = true
+			})
+			.EnsureNotNull();
 
+		if (showChromiumOutput)
+		{
+			this.ChromiumProcess.ErrorDataReceived += (o, e) => Console.Error.WriteLine(e.Data);
+			this.ChromiumProcess.OutputDataReceived += (o, e) => Console.WriteLine(e.Data);
+		}
+
+		this.ChromiumProcess.StandardError.ReadLine(); // make sure it started properly
 		this.HttpClient = new();
 
 		AppDomain.CurrentDomain.ProcessExit += this.CurrentDomain_ProcessExit;
@@ -86,7 +110,10 @@ public sealed class HtmlConverter : IDisposable
 		AppDomain.CurrentDomain.ProcessExit -= this.CurrentDomain_ProcessExit;
 	}
 
-	public Tab NewTab(string url = "about:blank") => new(this, url);
+	public Tab NewTab(string url = "about:blank")
+	{
+		return new(this, url);
+	}
 
 	public sealed class Tab : IDisposable
 	{
@@ -101,8 +128,8 @@ public sealed class HtmlConverter : IDisposable
 #pragma warning restore IDE1006 // Naming Styles
 
 		private int _commandId;
-		private HtmlConverter _parent;
-		private List<JsonNode> _eventQueue = new();
+		private readonly HtmlConverter _parent;
+		private readonly List<JsonNode> _eventQueue = new();
 
 		public ClientWebSocket WSClient { get; private set; }
 		public ChromeCdpInfo CdpInfo { get; private set; }
@@ -113,8 +140,10 @@ public sealed class HtmlConverter : IDisposable
 		{
 			this._parent = parent;
 			string str = parent.HttpClient
-				.PutAsync($"http://localhost:{parent.CdpPort}/json/new?{url}", null).Await()
-				.Content.ReadAsStringAsync().Await();
+				.PutAsync($"http://localhost:{parent.CdpPort}/json/new?{url}", null)
+				.Await()
+				.Content.ReadAsStringAsync()
+				.Await();
 			this.CdpInfo = str.FromJson<ChromeCdpInfo>();
 
 			if (parent.Debug)
@@ -124,8 +153,26 @@ public sealed class HtmlConverter : IDisposable
 			this.WSClient.ConnectAsync(new(this.CdpInfo.WebSocketDebuggerUrl), CancellationToken.None).Wait();
 		}
 
-		internal async Task<int> SendCommandInternal(string commandName, Dictionary<string, object>? @params = null, CancellationToken cancellationToken = default)
+		internal async Task EnsureWebSocketNotDead(CancellationToken ct = default)
 		{
+			if (this.WSClient.State == WebSocketState.CloseReceived)
+			{
+				throw new ApplicationException(
+					$"WebSocket is closed from remote unexpectedly. Close status: {this.WSClient.CloseStatus}");
+			}
+
+			if (this.WSClient.State == WebSocketState.Aborted ||
+				this.WSClient.State == WebSocketState.Closed)
+			{
+				await this.WSClient.ConnectAsync(new(this.CdpInfo.WebSocketDebuggerUrl), ct);
+			}
+		}
+		internal async Task<int> SendCommandInternal(string commandName,
+			Dictionary<string, object>? @params = null,
+			CancellationToken cancellationToken = default)
+		{
+			await this.EnsureWebSocketNotDead(cancellationToken);
+
 			int val = this._commandId++;
 			string str = new
 			{
@@ -153,8 +200,11 @@ public sealed class HtmlConverter : IDisposable
 
 			return obj;
 		}
-		public async Task<(JsonNode, WebSocketReceiveResult)> ReadOneMessage(CancellationToken cancellationToken = default)
+		public async Task<(JsonNode, WebSocketReceiveResult)> ReadOneMessage(CancellationToken cancellationToken =
+			default)
 		{
+			await this.EnsureWebSocketNotDead(cancellationToken);
+
 			using MemoryStream stream = new();
 
 			WebSocketReceiveResult result;
@@ -190,19 +240,30 @@ public sealed class HtmlConverter : IDisposable
 			JsonNode result = await this.ReadUntilFindIdInternal(id, cancellationToken);
 			return result;
 		}
-		public async Task<int> SendCommand(string commandName, Dictionary<string, object>? @params = null, CancellationToken cancellationToken = default)
+		public async Task<int> SendCommand(string commandName,
+			Dictionary<string, object>? @params = null,
+			CancellationToken cancellationToken = default)
 		{
 			using IDisposable _ = await this.CommonLock.DisposableLockAsync(cancellationToken);
 			int result = await this.SendCommandInternal(commandName, @params, cancellationToken);
 			return result;
 		}
 
-		public async Task<string> NavigateTo(string url, Func<Task>? thingsToDoBeforeWaiting = null, CancellationToken cancellationToken = default)
+		public async Task<string> NavigateTo(string url,
+			Func<Task>? thingsToDoBeforeWaiting = null,
+			CancellationToken cancellationToken = default)
 		{
 			await this.SendCommand("Page.enable", cancellationToken: cancellationToken);
 			this._eventQueue.Clear();
 			JsonNode result = await this.ReadUntilFindId(
-				await this.SendCommand("Page.navigate", new() { { "url", url } }, cancellationToken: cancellationToken),
+				await this.SendCommand("Page.navigate",
+					new()
+					{
+						{
+							"url", url
+						}
+					},
+					cancellationToken),
 				cancellationToken);
 
 			JsonNode? error = result["result"]!["errorText"];
@@ -232,7 +293,9 @@ public sealed class HtmlConverter : IDisposable
 
 			return (string)frame["id"]!;
 		}
-		public async Task HtmlAsPage(string html, Action? afterNavigate = null, CancellationToken cancellationToken = default)
+		public async Task HtmlAsPage(string html,
+			Action? afterNavigate = null,
+			CancellationToken cancellationToken = default)
 		{
 			string frameId = await this.NavigateTo("about:blank", cancellationToken: cancellationToken);
 			afterNavigate?.Invoke();
@@ -240,29 +303,64 @@ public sealed class HtmlConverter : IDisposable
 			using IDisposable _ = await this.CommonLock.DisposableLockAsync(cancellationToken);
 
 			await this.ReadUntilFindIdInternal(
-				await this.SendCommandInternal("Page.setDocumentContent", new() { { "frameId", frameId }, { "html", html } }, cancellationToken), cancellationToken);
+				await this.SendCommandInternal("Page.setDocumentContent",
+					new()
+					{
+						{
+							"frameId", frameId
+						},
+						{
+							"html", html
+						}
+					},
+					cancellationToken),
+				cancellationToken);
 		}
-		public async Task SetViewPortSize(int width, int height, double deviceScaleFactor, bool mobile, CancellationToken cancellationToken = default)
+		public async Task SetViewPortSize(int width,
+			int height,
+			double deviceScaleFactor,
+			bool mobile,
+			CancellationToken cancellationToken = default)
 		{
 			await this.SendCommand(
 				"Emulation.setDeviceMetricsOverride",
 				new()
 				{
-					{ "width", width },
-					{ "height", height },
-					{ "deviceScaleFactor", deviceScaleFactor },
-					{ "mobile", mobile }
-				}, cancellationToken);
+					{
+						"width", width
+					},
+					{
+						"height", height
+					},
+					{
+						"deviceScaleFactor", deviceScaleFactor
+					},
+					{
+						"mobile", mobile
+					}
+				},
+				cancellationToken);
 		}
 		public async Task<JsonNode> EvaluateJavaScript(string script, CancellationToken cancellationToken = default)
 		{
 			using IDisposable _ = await this.CommonLock.DisposableLockAsync(cancellationToken);
 
 			JsonNode result = await this.ReadUntilFindIdInternal(
-				await this.SendCommandInternal("Runtime.evaluate", new() { { "expression", script } }, cancellationToken), cancellationToken);
+				await this.SendCommandInternal("Runtime.evaluate",
+					new()
+					{
+						{
+							"expression", script
+						}
+					},
+					cancellationToken),
+				cancellationToken);
 			return result["result"]!;
 		}
-		public async Task<MemoryStream> TakePhotoOfCurrentPage(PhotoType photoType = PhotoType.Png, byte quality = 100, ViewPort? clip = null, CancellationToken ct = default)
+		public async Task<MemoryStream> TakePhotoOfCurrentPage(PhotoType photoType = PhotoType.Png,
+			byte quality = 100,
+			ViewPort? clip = null,
+			CancellationToken ct = default)
 		{
 			using IDisposable _2 = await this._parent.TakePhotoLock.DisposableLockAsync(ct);
 			using IDisposable _ = await this.CommonLock.DisposableLockAsync(ct);
@@ -272,12 +370,16 @@ public sealed class HtmlConverter : IDisposable
 
 			Dictionary<string, object> arg = new()
 			{
-				{ "format", photoType.ToString().ToLower() }
+				{
+					"format", photoType.ToString().ToLower()
+				}
 			};
 			if (photoType == PhotoType.Jpeg) arg.Add("quality", quality);
 			if (clip is not null) arg.Add("clip", clip);
 
 			int id = await this.SendCommandInternal("Page.captureScreenshot", arg, ct);
+
+			await this.EnsureWebSocketNotDead(ct);
 
 			using MemoryStream stream = new();
 			byte[] buffer = new byte[4096];
@@ -323,6 +425,7 @@ public sealed class HtmlConverter : IDisposable
 					result = null;
 					break;
 				}
+
 				reader.Read();
 				result = new(reader.GetBytesFromBase64());
 				break;
