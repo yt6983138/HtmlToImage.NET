@@ -58,7 +58,7 @@ public sealed class HtmlConverter : IDisposable
 		if (cdpPort == 0)
 			cdpPort = Helper.GetNewFreePort();
 
-		extraArgs ??= new();
+		extraArgs ??= [];
 		extraArgs.AddRange([
 			"--remote-allow-origins=*",
 			$"--window-size={windowWidth},{windowHeight}",
@@ -72,11 +72,11 @@ public sealed class HtmlConverter : IDisposable
 		// TODO: add cdp port get from stderr from chromium output
 		this.CdpPort = cdpPort;
 		this.ChromiumProcess = Process.Start(new ProcessStartInfo(chromiumLocation, extraArgs)
-			{
-				UseShellExecute = false,
-				RedirectStandardOutput = true,
-				RedirectStandardError = true
-			})
+		{
+			UseShellExecute = false,
+			RedirectStandardOutput = true,
+			RedirectStandardError = true
+		})
 			.EnsureNotNull();
 
 		if (showChromiumOutput)
@@ -129,7 +129,7 @@ public sealed class HtmlConverter : IDisposable
 
 		private int _commandId;
 		private readonly HtmlConverter _parent;
-		private readonly List<JsonNode> _eventQueue = new();
+		private readonly List<JsonNode> _eventQueue = [];
 
 		public ClientWebSocket WSClient { get; private set; }
 		public ChromeCdpInfo CdpInfo { get; private set; }
@@ -149,7 +149,7 @@ public sealed class HtmlConverter : IDisposable
 			if (parent.Debug)
 				Console.WriteLine(this.CdpInfo);
 			this.WSClient = new();
-			this.WSClient.Options.KeepAliveInterval = TimeSpan.FromSeconds(20);
+			this.WSClient.Options.KeepAliveInterval = TimeSpan.FromSeconds(10);
 			this.WSClient.ConnectAsync(new(this.CdpInfo.WebSocketDebuggerUrl), CancellationToken.None).Wait();
 		}
 
@@ -161,9 +161,11 @@ public sealed class HtmlConverter : IDisposable
 					$"WebSocket is closed from remote unexpectedly. Close status: {this.WSClient.CloseStatus}");
 			}
 
-			if (this.WSClient.State == WebSocketState.Aborted ||
-				this.WSClient.State == WebSocketState.Closed)
+			if (this.WSClient.State == WebSocketState.Aborted
+				|| this.WSClient.State == WebSocketState.Closed)
 			{
+				this.WSClient = new();
+				this.WSClient.Options.KeepAliveInterval = TimeSpan.FromSeconds(10);
 				await this.WSClient.ConnectAsync(new(this.CdpInfo.WebSocketDebuggerUrl), ct);
 			}
 		}
@@ -178,7 +180,7 @@ public sealed class HtmlConverter : IDisposable
 			{
 				id = val,
 				method = commandName,
-				@params = @params ?? new()
+				@params = @params ?? []
 				// reserved keyword bruh
 			}.ToJson();
 			byte[] buf = Encoding.UTF8.GetBytes(str);
@@ -284,7 +286,10 @@ public sealed class HtmlConverter : IDisposable
 				{
 					await this.ReadOneMessage(cancellationToken);
 				}
-				else firstLoop = false;
+				else
+				{
+					firstLoop = false;
+				}
 			}
 			while (loadEvent is null || frameNavigatedEvent is null);
 
@@ -393,7 +398,7 @@ public sealed class HtmlConverter : IDisposable
 					ref MemoryMarshal.GetArrayDataReference(stream.GetBuffer()),
 					(int)stream.Length); // prevent reallocation
 
-				Func<string> error = () => Encoding.UTF8.GetString(stream.GetBuffer());
+				string error() => Encoding.UTF8.GetString(stream.GetBuffer());
 
 				Utf8JsonReader reader = new(streamData);
 
@@ -410,7 +415,10 @@ public sealed class HtmlConverter : IDisposable
 					this._eventQueue.Add(JsonNode.Parse(ref anotherReader)!);
 					continue;
 				}
-				else if (type != "id") throw new InvalidDataException();
+				else if (type != "id")
+				{
+					throw new InvalidDataException();
+				}
 				// must be id now
 
 				reader.Read(); // id number
