@@ -1,6 +1,6 @@
 # HtmlToImage.NET
 
-A chromium driver, based on cdp.
+A chromium driver, based on cdp. Specifically designed for PSLDiscordBot and is optimized for large image transporting.
 
 Example:
 ```c#
