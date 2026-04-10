@@ -1,10 +1,35 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
+	<PropertyGroup>
+		<TargetFramework>net8.0</TargetFramework>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<Nullable>enable</Nullable>
+		<LangVersion>preview</LangVersion>
 
-  <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <Nullable>enable</Nullable>
-    <LangVersion>preview</LangVersion>
-  </PropertyGroup>
+		<AssemblyVersion>1.0.0</AssemblyVersion>
 
+		<PackageId>yt6983138.$(AssemblyName)</PackageId>
+		<Version>$(AssemblyVersion)</Version>
+		<Authors>yt6983138</Authors>
+		<Description>
+			A chromium driver based on cdp. Specifically designed for PSLDiscordBot and is optimized for large image transporting.
+		</Description>
+		<Copyright>Copyright © 2026 yt6983138 aka static_void</Copyright>
+		<PackageLicenseFile>LICENSE.txt</PackageLicenseFile>
+		<RepositoryUrl>https://github.com/yt6983138/HtmlToImage.NET/</RepositoryUrl>
+		<PackageReadmeFile>README.md</PackageReadmeFile>
+		<PackageTags>html;chromium;cdp;rendering;c#;.net;.netcore;library</PackageTags>
+
+		<GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<Content Include="../README.md;../LICENSE.txt" copyToOutput="true">
+			<IncludeInPackage>true</IncludeInPackage>
+			<CopyToOutput>true</CopyToOutput>
+			<BuildAction>Content</BuildAction>
+			<copyToOutput>true</copyToOutput>
+			<CopyToOutputDirectory>Always</CopyToOutputDirectory>
+			<PackagePath>.</PackagePath>
+		</Content>
+	</ItemGroup>
 </Project>
