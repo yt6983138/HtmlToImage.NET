@@ -1,5 +1,8 @@
 # HtmlToImage.NET
 
+> [!WARNING]
+> This library has been deprecated and unmaintained, it also have a lot of bugs, do not use this.
+
 A chromium driver, based on cdp. Specifically designed for PSLDiscordBot and is optimized for large image transporting.
 
 Example:
